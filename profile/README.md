@@ -107,111 +107,180 @@ backend. Сохранение обновляет все источники эт�
 
 ## Быстрый локальный запуск backend и Web UI
 
-Нужны **Git, Python 3, работающий Docker с Docker Compose** и SSH-доступ к GitHub.
-Репозиторий Web UI приватный: для клонирования нужны права в организации.
-Backend и Web UI собираются в контейнерах; устанавливать Java и Node.js
-на компьютер для этого варианта не требуется.
+Запуск состоит из **двух шагов**:
 
-### 1. Получить Web UI и запустить backend
+1. `scripts/backend.sh start` — запускает **backend и PostgreSQL**.
+2. `docker compose … -f deploy/web/compose.yaml up …` — запускает **только Web UI**
+   и подключает его к уже работающему backend.
 
-Выполните из каталога, где будут храниться исходники:
+Для этого варианта нужны **Git, Python 3, Docker с Docker Compose** и SSH-доступ
+к GitHub. Репозиторий Web UI приватный: для клонирования нужны права в организации.
+Java и Node.js для контейнерного запуска устанавливаются внутри образов.
+
+### Единая схема портов
+
+Во всех командах ниже используются одни и те же адреса:
+
+| Компонент | Адрес на компьютере | Соединение внутри Docker |
+| --- | --- | --- |
+| Web UI | `http://127.0.0.1:18010` | web-контейнер слушает `8080` |
+| Backend, Swagger и OBS | `http://127.0.0.1:18080` | Web UI обращается к `http://api:8080` |
+| PostgreSQL | Порт на компьютере не публикуется | Backend обращается к `postgres:5432` |
+
+`8080` — внутренний порт контейнеров. В браузере используйте **18010** для Web UI
+и **18080** для прямого доступа к backend. Одинаковый внутренний порт контейнеров
+не создаёт конфликта: наружу они опубликованы на разных портах.
+Оба опубликованных порта привязаны к `127.0.0.1` и доступны с этого компьютера.
+
+### 1. Поднять backend и PostgreSQL
+
+Получите исходники и перейдите в каталог Web UI:
 
 ```bash
 git clone git@github.com:UltiStatsDev/ultistats-web-ui.git
 cd ultistats-web-ui
-scripts/backend.sh start
 ```
 
-Скрипт сам получает отдельную копию backend на версии из `dev/backend/revision`,
-собирает приложение, поднимает PostgreSQL и проверяет API. Текущая зафиксированная
-версия содержит Event Log и scoreboard. Это изолированное dev-окружение;
-существующий каталог `ultistats-backend` скрипт не использует.
-Первая сборка скачивает зависимости и может занять несколько минут.
-
-Если Web UI уже клонирован, перейдите в его каталог и запустите
-`scripts/backend.sh start`. Используйте актуальный checkout: ранее собранный
-backend сам по себе не получает новые возможности после merge в GitHub.
-
-### 2. Запустить Web UI
-
-Из того же каталога, после успешного запуска backend:
+Если репозиторий уже клонирован, используйте его актуальный checkout.
+Все следующие команды выполняются **из каталога `ultistats-web-ui`**.
 
 ```bash
-docker compose --env-file /dev/null -f deploy/web/compose.yaml up --build -d --wait
+scripts/backend.sh start
+scripts/backend.sh status
 ```
 
-Web-контейнер подключается к созданной backend-сети и проксирует API
-и загруженные изображения.
+Скрипт получает отдельную копию backend в `dev/backend/.local/source`,
+выбирает версию из `dev/backend/revision`, собирает приложение и запускает
+**два контейнера: API и PostgreSQL**. Затем он ждёт их готовности и проверяет API.
+Текущая зафиксированная версия содержит Event Log и scoreboard.
+Первая сборка скачивает зависимости и может занять несколько минут.
+
+**Откуда берётся версия backend:** файл `dev/backend/revision` в репозитории
+Web UI содержит полный commit SHA. Скрипт клонирует
+`git@github.com:UltiStatsDev/ultistats-backend.git` в
+`dev/backend/.local/source`, при необходимости получает указанный коммит через
+`git fetch`, переключает эту отдельную копию на точный SHA (`checkout --detach`)
+и собирает образ `ultistats-web-ui-dev-backend:<SHA>` через Dockerfile backend.
+При следующих запусках используется та же локальная копия исходников.
+Автоматического выбора последнего `master` или образа `latest` здесь нет.
+
+Посмотреть закреплённую версию:
+
+```bash
+cat dev/backend/revision
+scripts/backend.sh status
+```
+
+Новый merge в backend не обновляет эту установку автоматически. Для обновления
+нужно согласованно изменить `dev/backend/revision` на проверенный полный SHA
+backend и пересобрать окружение командой `scripts/backend.sh start`.
+Актуальный checkout Web UI получает тот pin, который сохранён в его версии
+репозитория; локальные изменения отдельной копии backend скрипт перезаписывать
+отказывается. Подробный порядок обновления pin описан в
+[инструкции backend](https://github.com/UltiStatsDev/ultistats-web-ui/blob/main/docs/development/backend.md#stop-reset-update).
+
+После успешного выполнения backend уже работает на **18080**, независимо
+от того, запущен ли Web UI. Отдельно клонировать backend, устанавливать Java
+или запускать Compose из другого репозитория для этой схемы не требуется.
+
+Проверка backend:
+
+```bash
+curl --fail http://127.0.0.1:18080/v3/api-docs
+```
+
+### 2. Поднять Web UI
+
+После успешного шага 1 выполните из того же каталога:
+
+```bash
+WEB_PORT=18010 \
+BACKEND_ORIGIN=http://api:8080 \
+BACKEND_NETWORK=ultistats-web-ui-dev_default \
+docker compose --env-file /dev/null -p ultistats-web-ui-delivery \
+  -f deploy/web/compose.yaml up --build -d --wait
+```
+
+Эта команда запускает **только web-контейнер**. Его Compose-файл использует
+существующую сеть backend, созданную шагом 1. Порт, адрес API и сеть заданы
+явно, чтобы настройки окружения не направили Web UI на другой backend.
+
+Из браузера запросы к `/api` и `/uploads` идут на порт **18010**;
+web-контейнер передаёт их API по Docker-сети на `api:8080`.
+Использовать `127.0.0.1:18080` как `BACKEND_ORIGIN` внутри web-контейнера
+не нужно: внутри контейнера `127.0.0.1` обозначает сам этот контейнер.
 
 ### 3. Открыть приложение
 
 | Компонент | Адрес |
 | --- | --- |
 | Web UI | [http://127.0.0.1:18010](http://127.0.0.1:18010) |
-| API backend, пример списка матчей | [http://127.0.0.1:18080/api/v1/matches](http://127.0.0.1:18080/api/v1/matches) |
+| Список матчей API | [http://127.0.0.1:18080/api/v1/matches](http://127.0.0.1:18080/api/v1/matches) |
 | Swagger UI | [http://127.0.0.1:18080/swagger-ui.html](http://127.0.0.1:18080/swagger-ui.html) |
 | OpenAPI JSON | [http://127.0.0.1:18080/v3/api-docs](http://127.0.0.1:18080/v3/api-docs) |
 | Настройка Event Log и scoreboard | [http://127.0.0.1:18080/obs-admin.html](http://127.0.0.1:18080/obs-admin.html) |
 
-Ссылки эфирных источников формируются в OBS-админке после выбора матча:
-`http://127.0.0.1:18080/obs-battle-log.html?matchId=<UUID>` и
-`http://127.0.0.1:18080/obs-scoreboard.html?matchId=<UUID>`.
+Ссылки эфирных источников копируются из OBS-админки после выбора матча:
 
-Swagger и OBS-страницы открывайте **на порту backend `18080`**:
+- Event Log: `http://127.0.0.1:18080/obs-battle-log.html?matchId=<UUID>`.
+- Scoreboard: `http://127.0.0.1:18080/obs-scoreboard.html?matchId=<UUID>`.
+
+Swagger и OBS-страницы открывайте **на порту backend 18080**:
 Web UI проксирует только `/api` и `/uploads`.
-Порты `18080` и `18010` должны быть свободны. Если backend уже работает,
-его состояние можно проверить командой `scripts/backend.sh status`.
-Проверить наличие scoreboard в собранной версии можно так:
+Если страница scoreboard возвращает `404`, проверьте адрес и версию сборки:
+обновлённые исходники требуют пересборки backend через шаг 1.
+
+### Проверка и остановка
+
+Проверить оба компонента из каталога Web UI:
 
 ```bash
-curl --fail http://127.0.0.1:18080/obs-scoreboard.html
+scripts/backend.sh status
+docker compose --env-file /dev/null -p ultistats-web-ui-delivery \
+  -f deploy/web/compose.yaml ps
+curl --fail http://127.0.0.1:18010/healthz
 ```
 
-Ответ `404` означает, что по этому адресу работает сборка без страницы табло
-или запрос отправлен не на backend. Новая версия исходников требует пересборки
-приложения.
-
-### Разработка Web UI без контейнера
-
-Для режима разработки нужны Node.js **24.22.1 или новее в ветке 24**
-и pnpm **11.25.0**. Backend оставьте запущенным через `scripts/backend.sh`;
-вместо web-контейнера выполните из каталога Web UI:
+Остановить сначала Web UI, затем backend с PostgreSQL:
 
 ```bash
-pnpm install --frozen-lockfile
-pnpm dev --host 127.0.0.1 --port 5173 --strictPort
-```
-
-Web UI будет доступен на [http://127.0.0.1:5173](http://127.0.0.1:5173),
-API по умолчанию проксируется на `http://127.0.0.1:18080`.
-Dev-сервер работает, пока открыт этот процесс; остановка — `Ctrl+C`.
-
-### Остановка контейнерного варианта
-
-Из каталога Web UI:
-
-```bash
-docker compose --env-file /dev/null -f deploy/web/compose.yaml down
+docker compose --env-file /dev/null -p ultistats-web-ui-delivery \
+  -f deploy/web/compose.yaml down
 scripts/backend.sh stop
 ```
 
 Обычная остановка сохраняет базу и загруженные файлы в Docker volumes.
 Не добавляйте `--volumes` / `-v`, если хотите сохранить данные.
+Для повторного запуска выполните шаги 1 и 2.
 
-Если запускаете backend напрямую из его репозитория командой
-`docker compose up --build -d`, стандартный порт — **8080**.
-Для такого варианта используйте Swagger и OBS-админку на `http://127.0.0.1:8080`,
-а Web UI в режиме разработки запускайте с нужным адресом API:
+Если порт **18080** или **18010** занят, сначала определите, какой экземпляр
+его использует. Рабочие экземпляры с данными не останавливайте ради проверки;
+для описанной схемы используйте свободные порты или уже запущенный тот же комплект.
+Ошибка отсутствующей Docker-сети при запуске Web UI означает, что нужно
+проверить успешное выполнение шага 1.
+
+### Разработка Web UI без контейнера
+
+Backend запускается тем же шагом 1 и остаётся на **18080**.
+Для Web UI нужны Node.js **24.22.1 или новее в ветке 24** и pnpm **11.25.0**.
+Остановите web-контейнер командой `docker compose … down` из раздела выше,
+чтобы освободить **18010**, затем из каталога Web UI выполните:
 
 ```bash
-DEV_BACKEND_ORIGIN=http://127.0.0.1:8080 pnpm dev --host 127.0.0.1 --port 5173 --strictPort
+pnpm install --frozen-lockfile
+DEV_BACKEND_ORIGIN=http://127.0.0.1:18080 DEV_API_PROXY=true VITE_API_BASE_URL=/ \
+  pnpm dev --host 127.0.0.1 --port 18010 --strictPort
 ```
 
+Адреса остаются теми же: Web UI — **18010**, backend — **18080**.
+`--strictPort` запрещает dev-серверу незаметно перейти на другой порт.
+Остановка dev-сервера — `Ctrl+C`; backend продолжает работать.
+
 Подробности: [локальный backend](https://github.com/UltiStatsDev/ultistats-web-ui/blob/main/docs/development/backend.md),
-[Web UI](https://github.com/UltiStatsDev/ultistats-web-ui#окружение-и-запуск),
-[backend](https://github.com/UltiStatsDev/ultistats-backend#быстрый-старт).
+[Web UI](https://github.com/UltiStatsDev/ultistats-web-ui#окружение-и-запуск).
 
 ---
+
 
 ## Текущая реализация ядра
 
